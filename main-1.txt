@@ -1,0 +1,411 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_timezone/flutter_timezone.dart';
+import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:timezone/data/latest_all.dart' as tzd;
+import 'package:timezone/timezone.dart' as tz;
+
+typedef M = Map<String, dynamic>;
+final plugin = FlutterLocalNotificationsPlugin();
+const purple = Color(0xFF8B5CF6), blue = Color(0xFF3B82F6);
+const reps = ['Never', 'Daily', 'Weekly', 'Monthly', 'Yearly'];
+const pris = ['Low', 'Normal', 'High', 'Urgent'];
+const earlies = [0, 5, 10, 15, 30, 60];
+const cats = ['General', 'Work', 'Personal', 'Health'];
+const wdn = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+String key(DateTime d) => DateFormat('yyyy-MM-dd').format(d);
+String uid() => DateTime.now().microsecondsSinceEpoch.toString();
+int mins(M t) => (t['h'] as int) * 60 + (t['m'] as int);
+
+NotificationDetails nd(bool u) => NotificationDetails(
+    android: AndroidNotificationDetails(u ? 'mm_alarm' : 'mm_remind', u ? 'Alarms' : 'Reminders',
+        channelDescription: 'Muscle Memory',
+        importance: Importance.max, priority: Priority.high,
+        category: u ? AndroidNotificationCategory.alarm : AndroidNotificationCategory.reminder,
+        fullScreenIntent: u, ongoing: u, autoCancel: !u,
+        audioAttributesUsage: u ? AudioAttributesUsage.alarm : AudioAttributesUsage.notification,
+        actions: u ? const [AndroidNotificationAction('done', 'Dismiss', cancelNotification: true)] : null));
+
+class S extends ChangeNotifier {
+  late SharedPreferences p;
+  List<M> notes = [], rems = [], tasks = [];
+  String theme = 'system';
+  int early = 15;
+  bool paused = false;
+  bool _b = false, _a = false;
+  List<M> _l(String k) => (jsonDecode(p.getString(k) ?? '[]') as List).map((e) => Map<String, dynamic>.from(e)).toList();
+  Future<void> load() async {
+    p = await SharedPreferences.getInstance();
+    notes = _l('notes'); rems = _l('rems'); tasks = _l('tasks');
+    theme = p.getString('theme') ?? 'system'; early = p.getInt('early') ?? 15; paused = p.getBool('paused') ?? false;
+    resched();
+  }
+  void save({bool sched = true}) {
+    p.setString('notes', jsonEncode(notes)); p.setString('rems', jsonEncode(rems)); p.setString('tasks', jsonEncode(tasks));
+    p.setString('theme', theme); p.setInt('early', early); p.setBool('paused', paused);
+    notifyListeners();
+    if (sched) resched();
+  }
+  List<M> todayTasks() => tasks.where((t) => (t['days'] as List).contains(DateTime.now().weekday)).toList()
+    ..sort((a, b) => mins(a).compareTo(mins(b)));
+  int streak() {
+    int n = 0;
+    for (var i = 0; i < 365; i++) {
+      final d = DateTime.now().subtract(Duration(days: i));
+      final ts = tasks.where((t) => (t['days'] as List).contains(d.weekday)).toList();
+      if (ts.isEmpty) continue;
+      if (ts.every((t) => (t['done'] as List).contains(key(d)))) { n++; } else if (i > 0) { break; }
+    }
+    return n;
+  }
+  Future<void> askPerms() async {
+    final a = plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    await a?.requestNotificationsPermission();
+    await a?.requestExactAlarmsPermission();
+  }
+  Future<String> status() async {
+    final a = plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    final n = await a?.areNotificationsEnabled(), e = await a?.canScheduleExactNotifications();
+    return 'Notifications: ${n == true ? 'allowed' : 'blocked'}\nExact alarms: ${e == true ? 'allowed' : 'not allowed'}';
+  }
+  Future<void> resched() async {
+    if (_b) { _a = true; return; }
+    _b = true;
+    do { _a = false; await _run(); } while (_a);
+    _b = false;
+  }
+  Future<void> _z(int id, String t, String b, tz.TZDateTime at, DateTimeComponents? mc, bool u, AndroidScheduleMode m) =>
+      plugin.zonedSchedule(id, t, b, at, nd(u), androidScheduleMode: m,
+          uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime, matchDateTimeComponents: mc);
+  Future<void> _run() async {
+    try {
+      await plugin.cancelAll();
+      int n = 1;
+      final now = tz.TZDateTime.now(tz.local);
+      Future<void> go(String t, String b, tz.TZDateTime at, DateTimeComponents? mc, bool u) async {
+        if (mc == null && !at.isAfter(now)) return;
+        final id = n++;
+        try { await _z(id, t, b, at, mc, u, AndroidScheduleMode.exactAllowWhileIdle); }
+        catch (_) { try { await _z(id, t, b, at, mc, u, AndroidScheduleMode.inexactAllowWhileIdle); } catch (_) {} }
+      }
+      final mcs = [null, DateTimeComponents.time, DateTimeComponents.dayOfWeekAndTime, DateTimeComponents.dayOfMonthAndTime, DateTimeComponents.dateAndTime];
+      for (final r in rems) {
+        if (r['done'] == true) continue;
+        final at = tz.TZDateTime.from(DateTime.parse(r['when']), tz.local);
+        final mc = mcs[r['repeat'] as int];
+        await go(r['title'], '${r['desc']}', at, mc, (r['pri'] as int) >= 2);
+        final e = r['early'] as int;
+        if (e > 0) await go('In $e min: ${r['title']}', '${r['desc']}', at.subtract(Duration(minutes: e)), mc, false);
+      }
+      if (!paused) {
+        for (final t in tasks) {
+          for (final d in (t['days'] as List)) {
+            var x = tz.TZDateTime(tz.local, now.year, now.month, now.day, t['h'], t['m']);
+            while (x.weekday != d || x.isBefore(now)) { x = tz.TZDateTime(tz.local, x.year, x.month, x.day + 1, t['h'], t['m']); }
+            await go(t['title'], 'Routine task', x, DateTimeComponents.dayOfWeekAndTime, t['alarm'] == true);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+}
+
+final s = S();
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  tzd.initializeTimeZones();
+  try { tz.setLocalLocation(tz.getLocation(await FlutterTimezone.getLocalTimezone())); } catch (_) {}
+  await plugin.initialize(const InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher')));
+  await s.load();
+  runApp(const App());
+}
+
+Widget L(Widget Function(BuildContext) b) => ListenableBuilder(listenable: s, builder: (c, _) => b(c));
+Widget card(Widget ch) => Card(margin: const EdgeInsets.only(bottom: 10), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)), child: ch);
+Widget hd(String t) => Padding(padding: const EdgeInsets.fromLTRB(0, 16, 0, 8), child: Text(t, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)));
+Widget empty(String t) => Padding(padding: const EdgeInsets.all(14), child: Text(t, style: const TextStyle(color: Colors.grey)));
+void toast(BuildContext c, String t) => ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(t)));
+Future<bool> confirm(BuildContext c, String t) async => await showDialog<bool>(context: c, builder: (ctx) => AlertDialog(title: Text(t), content: const Text('This cannot be undone.'),
+    actions: [TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete'))])) ?? false;
+String cd(DateTime t) {
+  final d = t.difference(DateTime.now()), a = d.abs();
+  final x = a.inDays > 0 ? '${a.inDays}d ${a.inHours % 24}h' : a.inHours > 0 ? '${a.inHours}h ${a.inMinutes % 60}m' : '${a.inMinutes}m';
+  return d.isNegative ? '$x overdue' : 'in $x';
+}
+DateTime nextOcc(M r) {
+  var d = DateTime.parse(r['when']); final n = DateTime.now(); int g = 0;
+  while (r['repeat'] != 0 && d.isBefore(n) && g++ < 4000) {
+    d = [d, DateTime(d.year, d.month, d.day + 1, d.hour, d.minute), DateTime(d.year, d.month, d.day + 7, d.hour, d.minute),
+      DateTime(d.year, d.month + 1, d.day, d.hour, d.minute), DateTime(d.year + 1, d.month, d.day, d.hour, d.minute)][r['repeat'] as int];
+  }
+  return d;
+}
+Future<DateTime?> pickDT(BuildContext c, DateTime i) async {
+  final d = await showDatePicker(context: c, initialDate: i, firstDate: DateTime(2020), lastDate: DateTime(2100));
+  if (d == null || !c.mounted) return null;
+  final t = await showTimePicker(context: c, initialTime: TimeOfDay.fromDateTime(i));
+  if (t == null) return null;
+  return DateTime(d.year, d.month, d.day, t.hour, t.minute);
+}
+Widget dd(String l, int v, List<String> items, void Function(int) f) => DropdownButtonFormField<int>(value: v, decoration: InputDecoration(labelText: l),
+    items: [for (var i = 0; i < items.length; i++) DropdownMenuItem(value: i, child: Text(items[i]))], onChanged: (x) => f(x!));
+EdgeInsets sheetPad(BuildContext c) => EdgeInsets.fromLTRB(20, 20, 20, MediaQuery.of(c).viewInsets.bottom + 20);
+
+void editRem(BuildContext c, {M? r, String t = '', String d = '', int pri = 1}) {
+  final isNew = r == null;
+  final M m = r ?? <String, dynamic>{'id': uid(), 'title': t, 'desc': d, 'when': DateTime.now().add(const Duration(hours: 1)).toIso8601String(),
+    'end': null, 'repeat': 0, 'early': s.early, 'pri': pri, 'done': false, 'loc': ''};
+  final tc = TextEditingController(text: m['title']), dc = TextEditingController(text: m['desc']), lc = TextEditingController(text: m['loc']);
+  final f = DateFormat('EEE d MMM y, h:mm a');
+  showModalBottomSheet(context: c, isScrollControlled: true, builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
+    final w = DateTime.parse(m['when']);
+    return Padding(padding: sheetPad(ctx), child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      TextField(controller: tc, decoration: const InputDecoration(labelText: 'Title')),
+      TextField(controller: dc, maxLines: 2, decoration: const InputDecoration(labelText: 'Description')),
+      TextField(controller: lc, decoration: const InputDecoration(labelText: 'Location (optional)')),
+      ListTile(leading: const Icon(Icons.event), title: Text(f.format(w)), onTap: () async { final x = await pickDT(ctx, w); if (x != null) set(() => m['when'] = x.toIso8601String()); }),
+      ListTile(leading: const Icon(Icons.timer_off_outlined), title: Text(m['end'] == null ? 'Add end time' : 'Ends ${DateFormat('h:mm a').format(DateTime.parse(m['end']))}'),
+        onTap: () async { final x = await showTimePicker(context: ctx, initialTime: TimeOfDay.fromDateTime(w.add(const Duration(hours: 1)))); if (x != null) set(() => m['end'] = DateTime(w.year, w.month, w.day, x.hour, x.minute).toIso8601String()); }),
+      dd('Repeat', m['repeat'], reps, (v) => set(() => m['repeat'] = v)),
+      dd('Early alert', earlies.indexOf(m['early']).clamp(0, 5), [for (final e in earlies) e == 0 ? 'None' : '$e min before'], (v) => set(() => m['early'] = earlies[v])),
+      dd('Priority (High/Urgent ring as alarm)', m['pri'], pris, (v) => set(() => m['pri'] = v)),
+      const SizedBox(height: 12),
+      FilledButton(onPressed: () async {
+        if (tc.text.trim().isEmpty) return;
+        m['title'] = tc.text.trim(); m['desc'] = dc.text.trim(); m['loc'] = lc.text.trim();
+        if (isNew) s.rems.add(m);
+        Navigator.pop(ctx);
+        await s.askPerms(); s.save();
+      }, child: const Text('Save'))])));
+  }));
+}
+
+void editTask(BuildContext c, {M? t, String title = ''}) {
+  final isNew = t == null;
+  final M m = t ?? <String, dynamic>{'id': uid(), 'title': title, 'h': 7, 'm': 0, 'days': [1, 2, 3, 4, 5, 6, 7], 'done': [], 'alarm': false};
+  final tc = TextEditingController(text: m['title']);
+  showModalBottomSheet(context: c, isScrollControlled: true, builder: (ctx) => StatefulBuilder(builder: (ctx, set) => Padding(padding: sheetPad(ctx),
+    child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      TextField(controller: tc, decoration: const InputDecoration(labelText: 'Task')),
+      ListTile(leading: const Icon(Icons.schedule), title: Text(TimeOfDay(hour: m['h'], minute: m['m']).format(ctx)), onTap: () async {
+        final x = await showTimePicker(context: ctx, initialTime: TimeOfDay(hour: m['h'], minute: m['m']));
+        if (x != null) set(() { m['h'] = x.hour; m['m'] = x.minute; });
+      }),
+      Wrap(spacing: 6, children: [for (var d = 1; d <= 7; d++) FilterChip(label: Text(wdn[d - 1]), selected: (m['days'] as List).contains(d),
+        onSelected: (v) => set(() { if (v) { (m['days'] as List).add(d); } else { (m['days'] as List).remove(d); } }))]),
+      SwitchListTile(title: const Text('Ring as alarm'), value: m['alarm'], onChanged: (v) => set(() => m['alarm'] = v)),
+      FilledButton(onPressed: () async {
+        if (tc.text.trim().isEmpty || (m['days'] as List).isEmpty) return;
+        m['title'] = tc.text.trim();
+        if (isNew) s.tasks.add(m);
+        Navigator.pop(ctx);
+        await s.askPerms(); s.save();
+      }, child: const Text('Save'))])))));
+}
+
+class App extends StatelessWidget {
+  const App({super.key});
+  @override
+  Widget build(BuildContext context) => L((c) {
+    ThemeData t(Brightness b) => ThemeData(useMaterial3: true, brightness: b, colorScheme: ColorScheme.fromSeed(seedColor: purple, secondary: blue, brightness: b),
+        scaffoldBackgroundColor: b == Brightness.dark ? const Color(0xFF07071A) : null);
+    return MaterialApp(title: 'Muscle Memory', debugShowCheckedModeBanner: false, theme: t(Brightness.light), darkTheme: t(Brightness.dark),
+        themeMode: s.theme == 'light' ? ThemeMode.light : s.theme == 'dark' ? ThemeMode.dark : ThemeMode.system, home: const Home());
+  });
+}
+
+class Home extends StatefulWidget {
+  const Home({super.key});
+  @override
+  State<Home> createState() => _H();
+}
+class _H extends State<Home> {
+  int i = 0;
+  @override
+  Widget build(BuildContext c) => Scaffold(
+    body: SafeArea(child: [const Dash(), const Notes(), const Routines(), const Alarms(), const Settings()][i]),
+    bottomNavigationBar: NavigationBar(selectedIndex: i, onDestinationSelected: (v) => setState(() => i = v), destinations: const [
+      NavigationDestination(icon: Icon(Icons.home_rounded), label: 'Home'),
+      NavigationDestination(icon: Icon(Icons.sticky_note_2_rounded), label: 'Notes'),
+      NavigationDestination(icon: Icon(Icons.checklist_rounded), label: 'Routines'),
+      NavigationDestination(icon: Icon(Icons.alarm_rounded), label: 'Alarms'),
+      NavigationDestination(icon: Icon(Icons.settings_rounded), label: 'Settings')]));
+}
+
+Widget remTile(BuildContext c, M r) {
+  final w = nextOcc(r); final over = r['repeat'] == 0 && w.isBefore(DateTime.now()) && r['done'] != true;
+  return Dismissible(key: ValueKey(r['id']), background: Container(color: Colors.red), confirmDismiss: (_) => confirm(c, 'Delete reminder?'),
+    onDismissed: (_) { s.rems.remove(r); s.save(); },
+    child: card(ListTile(onTap: () => editRem(c, r: r),
+      leading: Checkbox(value: r['done'] == true, onChanged: (v) { r['done'] = v; s.save(); }),
+      title: Text(r['title'], style: TextStyle(decoration: r['done'] == true ? TextDecoration.lineThrough : null)),
+      subtitle: Text('${DateFormat('EEE d MMM, h:mm a').format(w)} · ${cd(w)} · ${pris[r['pri']]}${r['repeat'] != 0 ? ' · ${reps[r['repeat']]}' : ''}', style: TextStyle(color: over ? Colors.red : null)),
+      trailing: (r['pri'] as int) >= 2 ? const Icon(Icons.priority_high, color: Colors.orange) : null)));
+}
+Widget taskTile(BuildContext c, M t, {bool next = false}) {
+  final k = key(DateTime.now()); final done = (t['done'] as List).contains(k);
+  return Dismissible(key: ValueKey(t['id']), background: Container(color: Colors.red), confirmDismiss: (_) => confirm(c, 'Delete task?'),
+    onDismissed: (_) { s.tasks.remove(t); s.save(); },
+    child: card(ListTile(onTap: () => editTask(c, t: t),
+      leading: Checkbox(value: done, onChanged: (v) { if (v == true) { (t['done'] as List).add(k); } else { (t['done'] as List).remove(k); } s.save(sched: false); }),
+      title: Text(t['title'], style: TextStyle(color: next ? purple : null, fontWeight: next ? FontWeight.bold : null, decoration: done ? TextDecoration.lineThrough : null)),
+      subtitle: Text('${TimeOfDay(hour: t['h'], minute: t['m']).format(c)}${next ? ' · Up next' : ''}${t['alarm'] == true ? ' · alarm' : ''}'))));
+}
+
+class Dash extends StatelessWidget {
+  const Dash({super.key});
+  @override
+  Widget build(BuildContext context) => L((c) {
+    final n = DateTime.now();
+    final g = n.hour < 12 ? 'Good morning' : n.hour < 18 ? 'Good afternoon' : 'Good evening';
+    final up = s.rems.where((r) => r['done'] != true).toList()..sort((a, b) => nextOcc(a).compareTo(nextOcc(b)));
+    final over = up.where((r) => r['repeat'] == 0 && nextOcc(r).isBefore(n)).toList();
+    final soon = up.where((r) => !over.contains(r)).take(4).toList();
+    final today = s.todayTasks(); final k = key(n);
+    final done = today.where((t) => (t['done'] as List).contains(k)).length;
+    final nx = today.where((t) => !(t['done'] as List).contains(k) && mins(t) >= n.hour * 60 + n.minute).toList();
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      Row(children: [ClipRRect(borderRadius: BorderRadius.circular(12), child: Image.asset('assets/logo.png', width: 48, height: 48)), const SizedBox(width: 12),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(g, style: Theme.of(c).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
+          StreamBuilder(stream: Stream.periodic(const Duration(seconds: 20)), builder: (_, __) => Text(DateFormat('EEEE, d MMM y · h:mm a').format(DateTime.now())))]))]),
+      const SizedBox(height: 14),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        FilledButton.tonalIcon(onPressed: () => openNote(c), icon: const Icon(Icons.note_add), label: const Text('New Note')),
+        FilledButton.tonalIcon(onPressed: () => editRem(c), icon: const Icon(Icons.add_alert), label: const Text('Add Reminder')),
+        FilledButton.tonalIcon(onPressed: () => editRem(c, pri: 3), icon: const Icon(Icons.alarm_add), label: const Text('Set Alarm')),
+        FilledButton.tonalIcon(onPressed: () => editTask(c), icon: const Icon(Icons.checklist), label: const Text('Create Routine'))]),
+      if (over.isNotEmpty) hd('Overdue'), for (final r in over) remTile(c, r),
+      hd('Upcoming'), if (soon.isEmpty) empty('Nothing upcoming. Add a reminder to get started.'), for (final r in soon) remTile(c, r),
+      hd("Today's routine ($done/${today.length})"),
+      if (today.isNotEmpty) Padding(padding: const EdgeInsets.only(bottom: 10), child: LinearProgressIndicator(value: done / today.length, minHeight: 8, borderRadius: BorderRadius.circular(8))),
+      if (today.isEmpty) empty('No routine tasks today.'),
+      for (final t in today) taskTile(c, t, next: nx.isNotEmpty && nx.first == t)]);
+  });
+}
+
+class NoteEd extends StatefulWidget {
+  final M note;
+  const NoteEd(this.note, {super.key});
+  @override
+  State<NoteEd> createState() => _NE();
+}
+class _NE extends State<NoteEd> {
+  late final t = TextEditingController(text: widget.note['title']), b = TextEditingController(text: widget.note['body']);
+  void sv() {
+    final n = widget.note;
+    if (t.text.trim().isEmpty && b.text.trim().isEmpty) return;
+    n['title'] = t.text; n['body'] = b.text; n['ts'] = DateTime.now().toIso8601String();
+    if (!s.notes.contains(n)) s.notes.insert(0, n);
+    s.save(sched: false);
+  }
+  @override
+  Widget build(BuildContext c) => Scaffold(appBar: AppBar(title: const Text('Note (autosaves)')),
+    body: Padding(padding: const EdgeInsets.all(16), child: Column(children: [
+      TextField(controller: t, onChanged: (_) => sv(), style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold), decoration: const InputDecoration(hintText: 'Title', border: InputBorder.none)),
+      DropdownButton<String>(value: widget.note['cat'], items: [for (final x in cats) DropdownMenuItem(value: x, child: Text(x))], onChanged: (v) { setState(() => widget.note['cat'] = v); sv(); }),
+      Expanded(child: TextField(controller: b, onChanged: (_) => sv(), maxLines: null, expands: true, textAlignVertical: TextAlignVertical.top, decoration: const InputDecoration(hintText: 'Write something...', border: InputBorder.none)))])));
+}
+
+class Notes extends StatefulWidget {
+  const Notes({super.key});
+  @override
+  State<Notes> createState() => _N();
+}
+class _N extends State<Notes> {
+  String q = '';
+  @override
+  Widget build(BuildContext context) => L((c) {
+    final l = s.notes.where((n) => '${n['title']} ${n['body']}'.toLowerCase().contains(q.toLowerCase())).toList()
+      ..sort((a, b) { final x = (b['pin'] == true ? 1 : 0) - (a['pin'] == true ? 1 : 0); return x != 0 ? x : '${b['ts']}'.compareTo('${a['ts']}'); });
+    return Scaffold(backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton.extended(icon: const Icon(Icons.add), label: const Text('Note'),
+        onPressed: () => openNote(c)),
+      body: Column(children: [
+        Padding(padding: const EdgeInsets.all(16), child: TextField(onChanged: (v) => setState(() => q = v),
+          decoration: InputDecoration(prefixIcon: const Icon(Icons.search), hintText: 'Search notes', border: OutlineInputBorder(borderRadius: BorderRadius.circular(30))))),
+        Expanded(child: l.isEmpty ? Center(child: empty('No notes yet. Tap + to write one.')) : ListView(padding: const EdgeInsets.fromLTRB(16, 0, 16, 90), children: [
+          for (final n in l) card(ListTile(
+            onTap: () => Navigator.push(c, MaterialPageRoute(builder: (_) => NoteEd(n))),
+            leading: IconButton(icon: Icon(n['pin'] == true ? Icons.push_pin : Icons.push_pin_outlined, color: n['pin'] == true ? purple : null), onPressed: () { n['pin'] = n['pin'] != true; s.save(sched: false); }),
+            title: Text(n['title'] == '' ? '(untitled)' : n['title']),
+            subtitle: Text('${n['cat']} · ${n['body']}', maxLines: 2, overflow: TextOverflow.ellipsis),
+            trailing: PopupMenuButton<String>(onSelected: (v) async {
+              if (v == 'r') { editRem(c, t: n['title'], d: n['body']); }
+              else if (v == 't') { editTask(c, title: n['title']); }
+              else if (await confirm(c, 'Delete this note?')) { s.notes.remove(n); s.save(sched: false); }
+            }, itemBuilder: (_) => const [PopupMenuItem(value: 'r', child: Text('Convert to reminder')), PopupMenuItem(value: 't', child: Text('Convert to routine task')), PopupMenuItem(value: 'd', child: Text('Delete'))])))]))]));
+  });
+}
+
+class Routines extends StatelessWidget {
+  const Routines({super.key});
+  @override
+  Widget build(BuildContext context) => L((c) {
+    final today = s.todayTasks(), n = DateTime.now(), k = key(n);
+    final nx = today.where((t) => !(t['done'] as List).contains(k) && mins(t) >= n.hour * 60 + n.minute).toList();
+    final other = s.tasks.where((t) => !today.contains(t)).toList();
+    return Scaffold(backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton.extended(onPressed: () => editTask(c), icon: const Icon(Icons.add), label: const Text('Task')),
+      body: ListView(padding: const EdgeInsets.fromLTRB(16, 16, 16, 90), children: [
+        card(SwitchListTile(title: const Text('Routine active'), subtitle: Text('🔥 ${s.streak()} day streak${s.paused ? ' · paused, no notifications' : ''}'), value: !s.paused, onChanged: (v) { s.paused = !v; s.save(); })),
+        hd('Today'), if (today.isEmpty) empty('No tasks today. Tap + to create a routine task.'),
+        for (final t in today) taskTile(c, t, next: nx.isNotEmpty && nx.first == t),
+        if (other.isNotEmpty) hd('Other days'), for (final t in other) taskTile(c, t)]));
+  });
+}
+
+class Alarms extends StatelessWidget {
+  const Alarms({super.key});
+  @override
+  Widget build(BuildContext context) => L((c) {
+    final all = s.rems.toList()..sort((a, b) => nextOcc(a).compareTo(nextOcc(b)));
+    final act = all.where((r) => r['done'] != true).toList(), dn = all.where((r) => r['done'] == true).toList();
+    return Scaffold(backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton.extended(onPressed: () => editRem(c), icon: const Icon(Icons.add_alert), label: const Text('Reminder')),
+      body: ListView(padding: const EdgeInsets.fromLTRB(16, 16, 16, 90), children: [
+        hd('Reminders & alarms'), if (act.isEmpty) empty('No reminders. Tap + to add one.'), for (final r in act) remTile(c, r),
+        if (dn.isNotEmpty) hd('Completed'), for (final r in dn) remTile(c, r)]));
+  });
+}
+
+class Settings extends StatelessWidget {
+  const Settings({super.key});
+  @override
+  Widget build(BuildContext context) => L((c) => ListView(padding: const EdgeInsets.all(16), children: [
+    hd('Appearance'),
+    dd('Theme', ['system', 'light', 'dark'].indexOf(s.theme), ['System', 'Light', 'Dark'], (v) { s.theme = ['system', 'light', 'dark'][v]; s.save(sched: false); }),
+    hd('Defaults'),
+    dd('Default early alert', earlies.indexOf(s.early).clamp(0, 5), [for (final e in earlies) e == 0 ? 'None' : '$e min before'], (v) { s.early = earlies[v]; s.save(sched: false); }),
+    hd('Permissions'),
+    FutureBuilder<String>(future: s.status(), builder: (_, sn) => Text(sn.data ?? '...')),
+    const SizedBox(height: 8),
+    Wrap(spacing: 8, children: [
+      FilledButton.tonal(onPressed: () async { await s.askPerms(); s.save(); }, child: const Text('Grant permissions')),
+      FilledButton.tonal(onPressed: () async { await plugin.show(0, 'Test alarm', 'Muscle Memory alarm test', nd(true)); }, child: const Text('Send test alarm'))]),
+    hd('Battery & reliability'),
+    const Text('Phone makers (Samsung, Xiaomi, Oppo, etc.) may stop background apps. For reliable reminders, set Muscle Memory to "Unrestricted" battery usage and allow alarms & reminders in system settings. Android decides if a notification can be swiped away; urgent alarms are kept ongoing with a Dismiss button.'),
+    hd('Backup'),
+    Wrap(spacing: 8, children: [
+      FilledButton.tonal(onPressed: () { Clipboard.setData(ClipboardData(text: jsonEncode({'notes': s.notes, 'rems': s.rems, 'tasks': s.tasks}))); toast(c, 'Backup copied to clipboard. Paste it into a file or message to keep it.'); }, child: const Text('Export')),
+      FilledButton.tonal(onPressed: () {
+        final tc = TextEditingController();
+        showDialog(context: c, builder: (ctx) => AlertDialog(title: const Text('Import backup'), content: TextField(controller: tc, maxLines: 6, decoration: const InputDecoration(hintText: 'Paste backup here')),
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')), FilledButton(onPressed: () {
+            try {
+              final j = jsonDecode(tc.text) as Map;
+              List<M> g(String k) => ((j[k] ?? []) as List).map((e) => Map<String, dynamic>.from(e)).toList();
+              s.notes = g('notes'); s.rems = g('rems'); s.tasks = g('tasks'); s.save(); Navigator.pop(ctx);
+            } catch (_) { toast(c, 'That does not look like a valid backup.'); }
+          }, child: const Text('Replace data'))]));
+      }, child: const Text('Import'))]),
+  ]));
+}
+
+void openNote(BuildContext c) {
+  final M m = <String, dynamic>{'id': uid(), 'title': '', 'body': '', 'pin': false, 'cat': 'General'};
+  Navigator.push(c, MaterialPageRoute(builder: (_) => NoteEd(m)));
+}
