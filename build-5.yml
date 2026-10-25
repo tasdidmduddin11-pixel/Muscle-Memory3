@@ -1,0 +1,84 @@
+name: Build APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Arrange files
+        run: |
+          mkdir -p lib assets android_overrides tools
+          pick() { ls $1 2>/dev/null | grep -v "$2" | head -1; }
+          M=$(ls main*.txt main*.dart 2>/dev/null | head -1)
+          P=$(ls pubspec*.yaml | head -1)
+          I=$(pick 'icon*.png' icon_fg)
+          F=$(ls icon_fg*.png | head -1)
+          G=$(ls logo*.png | head -1)
+          A=$(ls AndroidManifest*.xml | head -1)
+          X=$(ls patch_gradle*.py | head -1)
+          echo "Using: $M $P $I $F $G $A $X"
+          mv "$M" lib/main.dart
+          [ "$P" = pubspec.yaml ] || mv "$P" pubspec.yaml
+          mv "$I" assets/icon.png
+          mv "$F" assets/icon_fg.png
+          mv "$G" assets/logo.png
+          mv "$A" android_overrides/AndroidManifest.xml
+          mv "$X" tools/patch_gradle.py
+      - name: Remove broken timezone plugin
+        run: |
+          sed -i '/flutter_timezone/d' pubspec.yaml lib/main.dart
+          python3 - <<'PY'
+          p = 'lib/main.dart'
+          s = open(p).read()
+          old = "try { tz.setLocalLocation(tz.getLocation(await FlutterTimezone.getLocalTimezone())); } catch (_) {}"
+          assert old in s
+          s = s.replace(old, "tz.setLocalLocation(localLoc());")
+          s += """
+          tz.Location localLoc() {
+            final now = DateTime.now();
+            final ds = [for (var i = 0; i < 4; i++) now.add(Duration(days: 90 * i))];
+            for (final l in tz.timeZoneDatabase.locations.values) {
+              if (ds.every((d) => l.timeZone(d.millisecondsSinceEpoch).offset == d.timeZoneOffset.inMilliseconds)) return l;
+            }
+            return tz.UTC;
+          }
+          """
+          open(p, 'w').write(s)
+          PY
+      - name: Fix duplicate notes bug
+        run: |
+          python3 - <<'PY'
+          p = 'lib/main.dart'
+          s = open(p).read()
+          old = "Navigator.push(c, MaterialPageRoute(builder: (_) => NoteEd(<String, dynamic>{'id': uid(), 'title': '', 'body': '', 'pin': false, 'cat': 'General'})))"
+          if old in s:
+              s = s.replace(old, 'openNote(c)')
+              s += """
+          void openNote(BuildContext c) {
+            final M m = <String, dynamic>{'id': uid(), 'title': '', 'body': '', 'pin': false, 'cat': 'General'};
+            Navigator.push(c, MaterialPageRoute(builder: (_) => NoteEd(m)));
+          }
+          """
+              open(p, 'w').write(s)
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter create --platforms=android --org com.musclememory --project-name muscle_memory .
+      - run: rm -rf test && cp android_overrides/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+      - run: python3 tools/patch_gradle.py
+      - run: flutter pub get
+      - run: dart run flutter_launcher_icons
+      - run: flutter build apk --debug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muscle-memory-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
